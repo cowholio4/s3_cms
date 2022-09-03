@@ -1,0 +1,296 @@
+---
+version: 2.1
+executors:
+  ruby-rails-deploy:
+    working_directory: ~/code
+    docker:
+      - image: cimg/ruby:3.1.2-browsers
+commands:
+  install-aws-client:
+    steps:
+      - run:
+          name: "Install AWS Client."
+          command: |
+            curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" > /tmp/awscliv2.zip
+            unzip /tmp/awscliv2.zip -d /tmp/awscliv2
+            sudo /tmp/awscliv2/aws/install
+  prep-cache:
+   # Machine Setup
+   - restore_cache:
+       name: "Restore Bundler Cache"
+       key: bundle-{{ checksum "Gemfile.lock" }}
+
+   - restore_cache:
+       name: "Restore Yarn Cache"
+       key: yarn-{{ checksum "yarn.lock" }}
+
+  refresh-cache:
+    # Save Yarn cache
+    - save_cache:
+        name: "Saving Yarn Cache"
+        key: yarn-{{ checksum "yarn.lock" }}
+        paths:
+          - .cache/yarn
+          - .yarn/cache
+          - node_modules
+    # Save bundler cache
+    - save_cache:
+        name: "Saving Bundler Cache"
+        key: bundle-{{ checksum "Gemfile.lock" }}
+        paths:
+          - vendor/bundle
+
+  bundle-install:
+  prep-yarn:
+    steps:
+      - run:
+          name: "Configure Yarn"
+          command: |
+            yarn set version berry
+  precompile-assets:
+    steps:
+      - prep-cache
+      # Dependencies
+      - bundle-install
+      - install-aws-client
+      - prep-yarn
+      - run:
+          name: "Precompile Assets"
+          command: |
+            bundle exec rails assets:precompile
+
+      - run:
+          name: "Sync Assets"
+          command: |
+            # aws s3 sync public/ s3://dashboard-seclytics-com-assets/ --acl public-read
+
+      - refresh-cache
+    steps:
+      - run:
+          name: "Bundle Install"
+          command: |
+              BUNDLER_VERSION=$(grep 'BUNDLED WITH' -A 1 Gemfile.lock | tail -n 1 | sed 's/^ *//g')
+              gem install bundler:$BUNDLER_VERSION
+              bundle check --path=vendor/bundle || bundle install --path=vendor/bundle --jobs=4 --retry=3
+
+  prep_tests:
+    steps:
+      # Prepare for artifact and test results.
+      # 'See docs https://circleci.com/docs/2.0/artifacts/'
+      - run: mkdir -p $CIRCLE_ARTIFACTS $CIRCLE_TEST_REPORTS
+      - prep-cache
+
+      # Dependencies
+      - run:
+          name: "Install Dependencies"
+          command: |
+            sudo apt-get update
+            sudo apt-get install default-mysql-client python2
+
+      - bundle-install
+      # wait for mysql
+      - run: dockerize -wait tcp://db:3306 -timeout 120s
+
+      # Load DB Schema
+      - install-aws-client
+
+      # when installing using just yarn install the env was not properly created
+      # to fix it we have to login to codeartifact first
+      - prep-yarn
+
+      - run:
+          name: "Prep DB"
+          command: |
+            bundle exec rails db:create db:schema:load db:seed --trace
+
+      - run:
+          name: "Precompile Assets (includes installing Yarn)"
+          command: |
+            bundle exec rails assets:precompile --trace
+
+  run_checks:
+    steps:
+      - run:
+          name: "Run Zeitwerk Check"
+          command: |
+            bundle exec rails zeitwerk:check 
+
+  run_tests:
+    steps:
+      # run tests
+      - run:
+          name: "Run Rails tests"
+          command: |
+            bundle exec rails test 
+
+jobs:
+  build:
+    working_directory: ~/code
+    parallelism: 1 
+    environment:
+      CIRCLE_ARTIFACTS: /tmp/circleci-artifacts
+      CIRCLE_TEST_REPORTS: /tmp/circleci-test-results
+    docker:
+      - image: cimg/ruby:3.1.2-browsers
+      - image: mysql:8.0.28
+        name: db
+        command:
+          [
+            --default-authentication-plugin=mysql_native_password,
+            --sql-mode=NO_ENGINE_SUBSTITUTION
+          ]
+        environment:
+          MYSQL_ROOT_PASSWORD: sec_pw
+
+    steps:
+      # Machine Setup
+      - checkout
+      - prep_tests
+      - run_tests
+
+  integration-test:
+    working_directory: ~/dashboard
+    environment:
+      CIRCLE_ARTIFACTS: /tmp/circleci-artifacts
+      CIRCLE_TEST_REPORTS: /tmp/circleci-test-results
+      MYSQL_HOST: db
+      MYSQL_USERNAME: root
+      MYSQL_PASSWORD: sec_pw
+
+    docker:
+      - image: cimg/ruby:3.1.2-browsers
+      - image: mysql:8.0.28
+        name: db
+        command:
+          [
+            --default-authentication-plugin=mysql_native_password,
+            --sql-mode=NO_ENGINE_SUBSTITUTION
+          ]
+        environment:
+          MYSQL_ROOT_PASSWORD: sec_pw
+
+    steps:
+      # Machine Setup
+      - checkout
+      - prep_tests
+      - integration_tests
+      - run_checks
+
+  upload-coverage:
+    working_directory: ~/dashboard
+    environment:
+      CIRCLE_ARTIFACTS: /tmp/circleci-artifacts
+      CIRCLE_TEST_REPORTS: /tmp/circleci-test-results
+
+    docker:
+      - image: cimg/ruby:3.1.2-browsers
+    steps:
+      - attach_workspace:
+          at: ~/dashboard
+      - install-aws-client
+      - setup-code-climate
+      - run:
+          name: "Compile test coverage"
+          command: |
+            ./cc-test-reporter sum-coverage codeclimate.*.json -o codeclimate.total.json
+            ./cc-test-reporter upload-coverage -i codeclimate.total.json --debug
+      - store_artifacts:
+          path: codeclimate.total.json
+  deploy-production:
+    executor: 'ruby-rails-deploy'
+    environment:
+      AWS_CODE_DEPLOY_DEPLOYMENT_GROUP_NAME: "production"
+    steps:
+      - checkout
+      - precompile-assets
+      - code-deploy
+  deploy-staging:
+    executor: 'ruby-rails-deploy'
+    environment:
+      AWS_CODE_DEPLOY_DEPLOYMENT_GROUP_NAME: "staging"
+    steps:
+      - checkout
+      - precompile-assets
+      - code-deploy
+  deploy-test:
+    executor: 'ruby-rails-deploy'
+    environment:
+      AWS_CODE_DEPLOY_DEPLOYMENT_GROUP_NAME: "test"
+    steps:
+      - checkout
+      - precompile-assets
+      - code-deploy
+  audit-git:
+    executor: 'python-pip'
+    steps:
+      - checkout
+      - run:
+          name: Validate Git Commits
+          command: |
+            pip install --upgrade gitlint
+            gitlint --commits "origin/master...$CIRCLE_SHA1"
+  audit:
+    executor: 'ruby-rails-deploy'
+    steps:
+      - checkout
+      - run:
+          name: "Install Dependencies"
+          command: |
+            sudo apt-get update
+            sudo apt-get install default-mysql-client
+      - bundle-install
+      - run:
+          name: "Audit Gems/Ruby"
+          command: |
+            bundle exec bundle-audit update && bundle exec bundle-audit
+            bundle exec ruby-audit
+  audit-yarn:
+    working_directory: ~/dashboard
+    executor: 'ruby-rails-deploy'
+    steps:
+      - checkout
+      - prep-cache
+      - install-aws-client
+      - prep-yarn
+
+      - run:
+          name: "Install Dependencies"
+          command: |
+            yarn install
+      - run:
+          name: "Audit Yarn"
+          command: |
+            yarn npm audit --all
+
+  lint:
+    executor: 'ruby-rails-deploy'
+    steps:
+      - checkout
+      - prep-cache
+      - run:
+          name: "Install Dependencies"
+          command: |
+            sudo apt-get update
+            sudo apt-get install default-mysql-client
+      - bundle-install
+      - run:
+          name: "Run Slim-lint"
+          command: |
+            bundle exec slim-lint
+
+workflows:
+  build-and-deploy:
+    jobs:
+      - audit-git
+      - audit-yarn
+      - audit
+      - lint
+      - build
+      - deploy-production:
+          context: AWS Credentials
+          requires:
+            - build
+          filters:
+            branches:
+              only:
+                - main
